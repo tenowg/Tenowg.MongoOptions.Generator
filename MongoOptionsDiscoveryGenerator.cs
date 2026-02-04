@@ -1,11 +1,9 @@
 ﻿using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Text;
-using System;
 using System.Collections.Immutable;
 using System.Linq;
 using System.Text;
-using System.Xml.Schema;
 
 [Generator]
 public class MongoOptionsDiscoveryGenerator : IIncrementalGenerator
@@ -38,7 +36,7 @@ public class MongoOptionsDiscoveryGenerator : IIncrementalGenerator
         var symbol = context.SemanticModel.GetDeclaredSymbol(classDecl);
 
         // We look for any attribute named "MongoOptions"
-        return symbol?.GetAttributes().Any(a => a.AttributeClass?.Name == "MongoOptionsAttribute") == true
+        return symbol?.GetAttributes().Any(a => a.AttributeClass?.Name == "MongoOptionAttribute") == true
                ? symbol.ToDisplayString() : null;
     }
 
