@@ -1,4 +1,5 @@
-﻿using Microsoft.CodeAnalysis;
+﻿#nullable enable
+using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using System.Collections.Generic;
 using System.Collections.Immutable;
@@ -9,18 +10,23 @@ namespace MongoOptions.Generator
 {
     public record PropertyInfo
     {
-        public string Name { get; set; }
-        public string TypeName { get; set; }
+        public string Name { get; set; } = string.Empty;
+        public string TypeName { get; set; } = string.Empty;
         public string? DisplayName { get; set; }
         public string? Description { get; set; }
         public bool IsRequired { get; set; }
+        public string? GenericTypeOne { get; set; }
+        public string? GenericTypeTwo { get; set; }
+        public bool IsNewable { get; set; }
+        public bool GenericTypeOneIsNewable { get; set; }
+        public bool GenericTypeTwoIsNewable { get; set; }
     }
 
     public class ClassInfo
     {
-        public string ClassName { get; set; }
-        public string FullName { get; set; }
-        public List<PropertyInfo> Properties { get; set; }
+        public string ClassName { get; set; } = string.Empty;
+        public string FullName { get; set; } = string.Empty;
+        public List<PropertyInfo> Properties { get; set; } = [];
         public bool IsValidatorClass { get; set; }
     }
 
@@ -40,7 +46,7 @@ namespace MongoOptions.Generator
             context.RegisterSourceOutput(provider.Collect(), Execute);
         }
 
-        private void Execute(SourceProductionContext context, ImmutableArray<ClassInfo> array)
+        private void Execute(SourceProductionContext context, ImmutableArray<ClassInfo?> array)
         {
             
             foreach (var info in array)
@@ -64,8 +70,8 @@ using Microsoft.Extensions.Options;
         public Type GetConfigType() => typeof({info.ClassName});
         public Type GetMonitorType() => typeof(IOptionsMonitor<{info.ClassName}>);
         public object Dispatcher(object model, global::MongoOptions.Interfaces.IClassDispatcher receiver) => 
-                    receiver.Execute<{shortName}>(model);
-        public IEnumerable<PropertyMetadata> GetProperties()
+                    receiver.Execute<{info.ClassName}>(model);
+        public IEnumerable<global::MongoOptions.Types.PropertyMetadata> GetProperties()
         {{
 {GeneratePropertyYields(info)}
         }}
@@ -82,7 +88,7 @@ using Microsoft.Extensions.Options;
             foreach (var prop in info.Properties)
             {
                 var typeName = prop.TypeName;
-                sb.AppendLine($@"            yield return new PropertyMetadata(
+                sb.AppendLine($@"            yield return new global::MongoOptions.Types.PropertyMetadata(
                 ""{prop.Name}"",
                 ""{prop.DisplayName}"",
                 ""{prop.Description}"",
@@ -93,8 +99,60 @@ using Microsoft.Extensions.Options;
                     var typedInstance = ({info.FullName})instance;
                     return (global::System.Linq.Expressions.Expression<global::System.Func<{typeName}>>)(() => typedInstance.{prop.Name});}},
                 Dispatcher: (model, receiver, self) => 
-                    receiver.Execute<{typeName}>(model, self)
-            );");
+                    receiver.Execute<{typeName}>(model, self),
+                DispatchGenericOne: (model, receiver, self) => 
+                    receiver.Execute<{prop.GenericTypeOne ?? "object"}>(model, self),
+                DispatchGenericTwo: (model, receiver, self) => 
+                    receiver.Execute<{prop.GenericTypeOne ?? "object"}, {prop.GenericTypeTwo ?? "object"}>(model, self),");
+
+
+                if (prop.IsNewable)
+                {
+                    sb.AppendLine($@"                New: () => new {typeName}(),");
+                }
+                else
+                {
+                    sb.AppendLine($@"                New: () => default({typeName}),");
+                }
+
+                if (prop.GenericTypeOne == null)
+                {
+                    sb.AppendLine($@"                NewTypePropertyOne: () => throw new InvalidOperationException(""Property {prop.Name} does not support NewTypePropertyOne.""),");
+                    sb.AppendLine($@"                null,");
+                }
+                else
+                {
+                    if (prop.GenericTypeOneIsNewable)
+                    {
+                        sb.AppendLine($@"                NewTypePropertyOne: () => new {prop.GenericTypeOne}(),");
+                    }
+                    else
+                    {
+                        sb.AppendLine($@"                NewTypePropertyOne: () => default({prop.GenericTypeOne}),");
+                        
+                    }
+                    sb.AppendLine($@"                typeof({prop.GenericTypeOne}),");
+                }
+
+                if (prop.GenericTypeTwo == null)
+                {
+                    sb.AppendLine($@"                NewTypePropertyTwo: () => throw new InvalidOperationException(""Property {prop.Name} does not support NewTypePropertyTwo.""),");
+                    sb.AppendLine($@"                null");
+                }
+                else
+                {
+                    if (prop.GenericTypeTwoIsNewable)
+                    {
+                        sb.AppendLine($@"                NewTypePropertyTwo: () => new {prop.GenericTypeTwo}(),");
+                    }
+                    else
+                    {
+                        sb.AppendLine($@"                NewTypePropertyTwo: () => default({prop.GenericTypeTwo}),");
+                    }
+                    sb.AppendLine($@"                typeof({prop.GenericTypeTwo})");
+                }
+
+                sb.AppendLine("            );");
             }
             return sb.ToString();
         }
@@ -115,13 +173,58 @@ using Microsoft.Extensions.Options;
                 .FirstOrDefault(arg => arg.Key == "Description")
                 .Value.Value?.ToString();
             prop.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+            
+            var isNewableType = false;
+            if (prop.Type is ITypeSymbol type)
+            {
+                isNewableType = IsNewable(type);
+            }
+            string? itemTypeNameOne = null; // prop.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+            var itemTypeOneIsNewable = isNewableType;
+            var itemTypeTwoIsNewable = isNewableType;
+            string? itemTypeNameTwo = null; // prop.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+
+            if (prop.Type is INamedTypeSymbol namedType && namedType.IsGenericType)
+            {
+                // For List<string>, TypeArguments[0] will be 'string'
+                ITypeSymbol? itemType = namedType.TypeArguments.FirstOrDefault(); 
+                
+                ITypeSymbol? itemTypeTwo = null;
+
+                if (namedType.TypeArguments.Length > 1)
+                {
+                    itemTypeTwo = namedType.TypeArguments[1];
+                }
+
+                if (itemType != null)
+                {
+                    // This gives you the full name (e.g., "System.String")
+                    itemTypeNameOne = itemType.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+                    itemTypeOneIsNewable = IsNewable(itemType);
+                    // Use this name to generate your AOT-safe casting code
+                }
+                if (itemTypeTwo != null)
+                {
+                    itemTypeNameTwo = itemTypeTwo.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+                    itemTypeTwoIsNewable = IsNewable(itemTypeTwo);
+                }
+            }
+
+            
+
+
             return new PropertyInfo {
                 Name = prop.Name,
                 TypeName = prop.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
                 DisplayName = displayName ?? prop.Name, // Fallback to prop name
                 Description = description ?? "",
-                IsRequired = !prop.NullableAnnotation.HasFlag(NullableAnnotation.Annotated) // AOT-safe required check
-            }; ;
+                IsRequired = !prop.NullableAnnotation.HasFlag(NullableAnnotation.Annotated),
+                GenericTypeOne = itemTypeNameOne,
+                GenericTypeTwo = itemTypeNameTwo,
+                IsNewable = isNewableType,
+                GenericTypeOneIsNewable = itemTypeOneIsNewable,
+                GenericTypeTwoIsNewable = itemTypeTwoIsNewable
+            };
         }
 
         private static ClassInfo? GetProperties(GeneratorSyntaxContext context)
@@ -164,6 +267,32 @@ using Microsoft.Extensions.Options;
             sb.Append(' ', indent * tabs);
             sb.Append(Value + "\n");
             return sb;
+        }
+
+        private static bool IsNewable(ITypeSymbol type)
+        {
+            // 1. Strings are a special case: public class String, but no new()
+            if (type.SpecialType == SpecialType.System_String)
+                return false;
+
+            // 2. Value Types (int, bool, struct, enum) always have new()
+            if (type.IsValueType)
+                return true;
+
+            // 3. Reference Types (Classes)
+            if (type is INamedTypeSymbol namedType)
+            {
+                // Abstracts/Interfaces cannot be instantiated
+                if (namedType.IsAbstract)
+                    return false;
+
+                // Look for a public constructor with zero parameters
+                return namedType.InstanceConstructors.Any(c =>
+                    c.Parameters.Length == 0 &&
+                    c.DeclaredAccessibility == Accessibility.Public);
+            }
+
+            return false;
         }
     }
 }
