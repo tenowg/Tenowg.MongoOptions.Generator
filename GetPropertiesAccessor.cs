@@ -1,10 +1,14 @@
 ﻿#nullable enable
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Data;
+using System.Diagnostics;
 using System.Linq;
 using System.Text;
+using System.Xml.Linq;
 
 namespace MongoOptions.Generator
 {
@@ -20,6 +24,7 @@ namespace MongoOptions.Generator
         public bool IsNewable { get; set; }
         public bool GenericTypeOneIsNewable { get; set; }
         public bool GenericTypeTwoIsNewable { get; set; }
+        public IPropertySymbol? symbol { get; set; }
     }
 
     public class ClassInfo
@@ -28,30 +33,71 @@ namespace MongoOptions.Generator
         public string FullName { get; set; } = string.Empty;
         public List<PropertyInfo> Properties { get; set; } = [];
         public bool IsValidatorClass { get; set; }
+        public bool IsInterface { get; set; }
+        public List<string> WhiteList { get; set; } = [];
+        public List<ClassInfo> InterfaceClasses { get; set; } = [];
     }
 
     [Generator]
     public class GetPropertiesAccessor : IIncrementalGenerator
-    {
-        private int indent = 4;
+    {       
         public void Initialize(IncrementalGeneratorInitializationContext context)
         {
-            //Debugger.Launch();
+            //Debugger.Launch(); 
+
+            var externalDispatchers = context.CompilationProvider.Select((compilation, _) =>
+            {
+                var attributeSymbol = compilation.GetTypeByMetadataName("MongoOptions.Attributes.CustomDispatcherAttribute");
+                if (attributeSymbol is null) return ImmutableArray<ClassInfo>.Empty;
+
+                var result = new List<ClassInfo>();
+
+                // Recursive helper to crawl through namespaces
+                void ScanNamespace(INamespaceSymbol ns)
+                {
+                    foreach (var type in ns.GetTypeMembers())
+                    {
+                        if (type.TypeKind == TypeKind.Interface &&
+                            type.GetAttributes().Any(a => SymbolEqualityComparer.Default.Equals(a.AttributeClass, attributeSymbol)))
+                        {
+                            var classinfo = GetProperties(type);
+                            if (classinfo != null)
+                                result.Add(classinfo); //type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat));
+                        }
+                    }
+
+                    foreach (var nestedNs in ns.GetNamespaceMembers())
+                    {
+                        ScanNamespace(nestedNs);
+                    }
+                }
+
+                ScanNamespace(compilation.GlobalNamespace);
+                return result.ToImmutableArray();
+            });
+
+
             var provider = context.SyntaxProvider
                 .CreateSyntaxProvider(
-                    predicate: (s, _) => s is ClassDeclarationSyntax { AttributeLists.Count: > 0 },
-                    transform: (ctx, _) => GetProperties(ctx))
+                    predicate: (s, _) => s is ClassDeclarationSyntax { AttributeLists.Count: > 0 } || s is InterfaceDeclarationSyntax { AttributeLists.Count: > 0 },
+                    transform: (ctx, _) => GetClassProperties(ctx))
                 .Where(static m => m is not null);
 
-            context.RegisterSourceOutput(provider.Collect(), Execute);
+            var combined = provider.Combine(externalDispatchers);
+
+            context.RegisterSourceOutput(combined.Collect(), Execute);
         }
 
-        private void Execute(SourceProductionContext context, ImmutableArray<ClassInfo?> array)
+        private void Execute(SourceProductionContext context, ImmutableArray<(ClassInfo? Left, ImmutableArray<ClassInfo> Right)> array)
         {
             
-            foreach (var info in array)
+            foreach (var combinedInfo in array)
             {
-                if (info is null) continue;
+                if (combinedInfo.Left is null || combinedInfo.Left.IsInterface) continue;
+
+                var info = combinedInfo.Left;
+
+                info.InterfaceClasses = combinedInfo.Right.ToList();
 
                 var lastDot = info.ClassName.LastIndexOf('.');
                 var ns = lastDot > -1 ? info.ClassName.Substring(0, lastDot).Replace("global::", "") : "";
@@ -69,8 +115,13 @@ using Microsoft.Extensions.Options;
     {{
         public Type GetConfigType() => typeof({info.ClassName});
         public Type GetMonitorType() => typeof(IOptionsMonitor<{info.ClassName}>);
-        public object Dispatcher(object model, global::MongoOptions.Interfaces.IClassDispatcher receiver) => 
-                    receiver.Execute<{info.ClassName}>(model);
+        public object Dispatcher(object model, object receiver)
+            {{ 
+                if (receiver is global::MongoOptions.Interfaces.IConfigDispatcherGateway<object> dispatcher)
+                    return dispatcher.Execute<{info.ClassName}>(model);
+                
+                throw new NotSupportedException(""Dispatcher type unknown at compile time."");
+            }}   
         public IEnumerable<global::MongoOptions.Types.PropertyMetadata> GetProperties()
         {{
 {GeneratePropertyYields(info)}
@@ -137,7 +188,7 @@ using Microsoft.Extensions.Options;
                 if (prop.GenericTypeTwo == null)
                 {
                     sb.AppendLine($@"                NewTypePropertyTwo: () => throw new InvalidOperationException(""Property {prop.Name} does not support NewTypePropertyTwo.""),");
-                    sb.AppendLine($@"                null");
+                    sb.AppendLine($@"                null,");
                 }
                 else
                 {
@@ -149,12 +200,50 @@ using Microsoft.Extensions.Options;
                     {
                         sb.AppendLine($@"                NewTypePropertyTwo: () => default({prop.GenericTypeTwo}),");
                     }
-                    sb.AppendLine($@"                typeof({prop.GenericTypeTwo})");
+                    sb.AppendLine($@"                typeof({prop.GenericTypeTwo}),");
                 }
+
+                BuildDispatcher(sb, info, prop);
 
                 sb.AppendLine("            );");
             }
             return sb.ToString();
+        }
+
+        private StringBuilder BuildDispatcher(StringBuilder sb, ClassInfo info, PropertyInfo? prop)
+        {
+            string typeName = prop.TypeName;
+            string typeNameTwo = "";
+            if (prop.GenericTypeOne != null) 
+                typeName = prop.GenericTypeOne;
+            if (prop.GenericTypeTwo != null)
+                typeNameTwo = ", " + prop.GenericTypeTwo;
+
+            sb.Append($@"
+                AotDispatch: (model, dispatcher, self) => 
+                {{
+                    if (dispatcher is global::MongoOptions.Interfaces.IDispatcherGateway<object> gateway)
+                    {{
+                        return gateway.Execute<{typeName}{typeNameTwo}>(model, self);
+                    }}");
+
+            foreach (var interfaces in info.InterfaceClasses)
+            {
+                if (IsTypeAllowed(prop.symbol, interfaces.WhiteList))
+                {
+                    sb.Append($@"
+                    if (dispatcher is {interfaces.ClassName} {interfaces.FullName}ui)
+                    {{
+                        return {interfaces.FullName}ui.Execute<{typeName}{typeNameTwo}>(model, self);
+                    }}
+                    ");
+                }
+            }
+
+            sb.AppendLine($@"
+                    throw new NotSupportedException(""Dispatcher type unknown at compile time."");
+                }}");
+            return sb;
         }
 
         private static PropertyInfo MapProperty(IPropertySymbol prop)
@@ -172,17 +261,16 @@ using Microsoft.Extensions.Options;
             var description = displayAttr?.NamedArguments
                 .FirstOrDefault(arg => arg.Key == "Description")
                 .Value.Value?.ToString();
-            prop.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
             
             var isNewableType = false;
             if (prop.Type is ITypeSymbol type)
             {
                 isNewableType = IsNewable(type);
             }
-            string? itemTypeNameOne = null; // prop.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+            string? itemTypeNameOne = null;
             var itemTypeOneIsNewable = isNewableType;
             var itemTypeTwoIsNewable = isNewableType;
-            string? itemTypeNameTwo = null; // prop.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+            string? itemTypeNameTwo = null;
 
             if (prop.Type is INamedTypeSymbol namedType && namedType.IsGenericType)
             {
@@ -210,9 +298,6 @@ using Microsoft.Extensions.Options;
                 }
             }
 
-            
-
-
             return new PropertyInfo {
                 Name = prop.Name,
                 TypeName = prop.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
@@ -223,22 +308,47 @@ using Microsoft.Extensions.Options;
                 GenericTypeTwo = itemTypeNameTwo,
                 IsNewable = isNewableType,
                 GenericTypeOneIsNewable = itemTypeOneIsNewable,
-                GenericTypeTwoIsNewable = itemTypeTwoIsNewable
+                GenericTypeTwoIsNewable = itemTypeTwoIsNewable,
+                symbol = prop
             };
         }
 
-        private static ClassInfo? GetProperties(GeneratorSyntaxContext context)
+        private static ClassInfo? GetClassProperties(GeneratorSyntaxContext context)
         {
-            var classDecl = (ClassDeclarationSyntax)context.Node;
-            var symbol = context.SemanticModel.GetDeclaredSymbol(classDecl) as INamedTypeSymbol;
+            INamedTypeSymbol? symbol = null;
+            if (context.Node is ClassDeclarationSyntax classDecl)
+            {
+                symbol = context.SemanticModel.GetDeclaredSymbol(classDecl) as INamedTypeSymbol;
+            }
+            
+            if (context.Node is InterfaceDeclarationSyntax interfaceDecl)
+            {
+                symbol = context.SemanticModel.GetDeclaredSymbol(interfaceDecl) as INamedTypeSymbol;
+            }
 
+            if (symbol == null) return null;
+
+            return GetProperties(symbol);
+        }
+
+        private static ClassInfo? GetProperties(INamedTypeSymbol symbol)
+        {
             if (symbol == null) return null;
 
             var hasAttribute = symbol.GetAttributes()
                 .Any(a => a.AttributeClass?.Name == "MongoOptionAttribute" ||
                           a.AttributeClass?.Name == "SubClassAttribute");
 
-            if (!hasAttribute) return null;
+            var hasInterfaceAttribute = symbol.GetAttributes()
+                .Any(a => a.AttributeClass?.Name == "CustomDispatcherAttribute");
+
+            if (!hasAttribute && !hasInterfaceAttribute) return null;
+
+            var displayAttr = symbol.GetAttributes().FirstOrDefault(a => a.AttributeClass?.Name == "CustomDispatcherAttribute");
+            string? whitelist = displayAttr?.NamedArguments
+                .FirstOrDefault(arg => arg.Key == "WhiteList")
+                .Value.Value?.ToString();
+            List<string> WhiteList = whitelist?.Replace(" ", "").Split(',').ToList() ?? [];
 
             var properties = symbol.GetMembers()
                 .OfType<IPropertySymbol>()
@@ -252,7 +362,9 @@ using Microsoft.Extensions.Options;
             {
                 ClassName = symbol.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
                 FullName = symbol.Name,
-                Properties = []
+                Properties = [],
+                WhiteList = WhiteList,
+                IsInterface = hasInterfaceAttribute
             };
 
             foreach (var property in properties) {
@@ -262,36 +374,60 @@ using Microsoft.Extensions.Options;
             return classInfo;
         }
 
-        private StringBuilder AppendWithIndent(StringBuilder sb, string Value, int tabs)
-        {
-            sb.Append(' ', indent * tabs);
-            sb.Append(Value + "\n");
-            return sb;
-        }
-
         private static bool IsNewable(ITypeSymbol type)
         {
-            // 1. Strings are a special case: public class String, but no new()
             if (type.SpecialType == SpecialType.System_String)
                 return false;
 
-            // 2. Value Types (int, bool, struct, enum) always have new()
             if (type.IsValueType)
                 return true;
 
-            // 3. Reference Types (Classes)
             if (type is INamedTypeSymbol namedType)
             {
-                // Abstracts/Interfaces cannot be instantiated
                 if (namedType.IsAbstract)
                     return false;
 
-                // Look for a public constructor with zero parameters
                 return namedType.InstanceConstructors.Any(c =>
                     c.Parameters.Length == 0 &&
                     c.DeclaredAccessibility == Accessibility.Public);
             }
 
+            return false;
+        }
+
+        private static bool IsAllowed(IPropertySymbol propertySymbol, List<string> allowedTypes)
+        {
+            if (allowedTypes.Count == 0) return true; 
+            ITypeSymbol propertyType = propertySymbol.Type;
+
+            // 1. Get the simple name (e.g., "String" or "MyEnum")
+            string typeName = propertyType.Name;
+
+            // 2. Check if it's an Enum generally
+            bool isEnum = propertyType.TypeKind == TypeKind.Enum;
+
+            // 3. Perform the validation
+            return allowedTypes.Contains(typeName) ||
+                (allowedTypes.Contains("Enum") && isEnum);
+        }
+
+        private static bool IsTypeAllowed(IPropertySymbol propertySymbol, List<string> allowedTypes)
+        {
+            if (allowedTypes.Count == 0) return true;
+            ITypeSymbol type = propertySymbol.Type;
+
+            // 1. Unwrap Nullables first
+            if (type is INamedTypeSymbol named && named.OriginalDefinition.SpecialType == SpecialType.System_Nullable_T)
+                type = named.TypeArguments[0];
+
+            foreach (var allowed in allowedTypes)
+            {
+                // Check for special "Keyword" match
+                if (allowed == "Enum" && type.TypeKind == TypeKind.Enum) return true;
+
+                // Check for exact name match (e.g., "Int32", "AnotherTest")
+                if (string.Equals(type.Name, allowed, StringComparison.OrdinalIgnoreCase)) return true;
+            }
             return false;
         }
     }
