@@ -149,12 +149,7 @@ using Microsoft.Extensions.Options;
                 ExpressionFactory: (instance) => {{
                     var typedInstance = ({info.FullName})instance;
                     return (global::System.Linq.Expressions.Expression<global::System.Func<{typeName}>>)(() => typedInstance.{prop.Name});}},
-                Dispatcher: (model, receiver, self) => 
-                    receiver.Execute<{typeName}>(model, self),
-                DispatchGenericOne: (model, receiver, self) => 
-                    receiver.Execute<{prop.GenericTypeOne ?? "object"}>(model, self),
-                DispatchGenericTwo: (model, receiver, self) => 
-                    receiver.Execute<{prop.GenericTypeOne ?? "object"}, {prop.GenericTypeTwo ?? "object"}>(model, self),");
+                ");
 
 
                 if (prop.IsNewable)
@@ -163,7 +158,14 @@ using Microsoft.Extensions.Options;
                 }
                 else
                 {
-                    sb.AppendLine($@"                New: () => default({typeName}),");
+                    if (typeName == "string")
+                    {
+                        sb.AppendLine($@"                New: () => string.Empty,");
+                    }
+                    else
+                    {
+                        sb.AppendLine($@"                New: () => default({typeName}),");
+                    }
                 }
 
                 if (prop.GenericTypeOne == null)
@@ -179,7 +181,14 @@ using Microsoft.Extensions.Options;
                     }
                     else
                     {
-                        sb.AppendLine($@"                NewTypePropertyOne: () => default({prop.GenericTypeOne}),");
+                        if (prop.GenericTypeOne == "string" )
+                        {
+                            sb.AppendLine($@"                NewTypePropertyOne: () => string.Empty,");
+                        }
+                        else
+                        {
+                            sb.AppendLine($@"                NewTypePropertyOne: () => default({prop.GenericTypeOne}),");
+                        }
                         
                     }
                     sb.AppendLine($@"                typeof({prop.GenericTypeOne}),");
@@ -198,7 +207,14 @@ using Microsoft.Extensions.Options;
                     }
                     else
                     {
-                        sb.AppendLine($@"                NewTypePropertyTwo: () => default({prop.GenericTypeTwo}),");
+                        if (prop.GenericTypeTwo == "string")
+                        {
+                            sb.AppendLine($@"                NewTypePropertyTwo: () => string.Empty,");
+                        }
+                        else
+                        {
+                            sb.AppendLine($@"                NewTypePropertyTwo: () => default({prop.GenericTypeTwo}),");
+                        }
                     }
                     sb.AppendLine($@"                typeof({prop.GenericTypeTwo}),");
                 }
