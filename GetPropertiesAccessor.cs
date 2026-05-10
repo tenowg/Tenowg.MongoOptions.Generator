@@ -4,11 +4,8 @@ using Microsoft.CodeAnalysis.CSharp.Syntax;
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Data;
-using System.Diagnostics;
 using System.Linq;
 using System.Text;
-using System.Xml.Linq;
 
 namespace MongoOptions.Generator
 {
@@ -25,6 +22,7 @@ namespace MongoOptions.Generator
         public bool GenericTypeOneIsNewable { get; set; }
         public bool GenericTypeTwoIsNewable { get; set; }
         public IPropertySymbol? symbol { get; set; }
+        public bool MergeIgnored { get; set; }
     }
 
     public class ClassInfo
@@ -36,6 +34,7 @@ namespace MongoOptions.Generator
         public bool IsInterface { get; set; }
         public List<string> WhiteList { get; set; } = [];
         public List<ClassInfo> InterfaceClasses { get; set; } = [];
+        public string? VersionPropertyName { get; set; }
     }
 
     [Generator]
@@ -103,6 +102,9 @@ namespace MongoOptions.Generator
                 var ns = lastDot > -1 ? info.ClassName.Substring(0, lastDot).Replace("global::", "") : "";
                 var shortName = lastDot > -1 ? info.ClassName.Substring(lastDot + 1) : info.ClassName;
 
+                var mergeBody = string.Join("\n            ",
+                    info.Properties.Where(x => !x.MergeIgnored).Select(p => $"this.{p.Name} = other.{p.Name};"));
+
                 var source = $@"
 using System;
 using System.Collections.Generic;
@@ -111,8 +113,29 @@ using Microsoft.Extensions.Options;
 
 {(string.IsNullOrEmpty(ns) ? "" : $"namespace {ns}")}
 {{
-    public partial class {shortName} : global::MongoOptions.Interfaces.IConfigFile
+    [global::MongoDB.Bson.Serialization.Attributes.BsonIgnoreExtraElements]
+    public partial class {shortName} : global::MongoOptions.Interfaces.IConfigFile, global::MongoOptions.Interfaces.IMergable<{info.ClassName}>
     {{
+        public bool IsVersioned() => {(info.VersionPropertyName == null ? "false" : "true")};
+        public void SetVersion(int version) {{ {(info.VersionPropertyName == null ? "_" : info.VersionPropertyName)} = version;}}
+        public int GetVersion() {{ return {(info.VersionPropertyName == null ? 0 : info.VersionPropertyName)}; }}
+        public string GetVersionPropertyName() => {(info.VersionPropertyName == null ? "string.Empty" : $"\"{info.VersionPropertyName}\"")};
+
+        public {info.ClassName} Clone()
+        {{
+            if (this == null) return default;
+
+            var json = global::System.Text.Json.JsonSerializer.Serialize(this, global::{ns}.{shortName}JsonContext.Default.{shortName});
+            return global::System.Text.Json.JsonSerializer.Deserialize<{info.ClassName}>(json);
+        }}
+            
+        public void Merge({info.ClassName} other)
+        {{
+            if (other == null) return;
+
+            {mergeBody}
+        }}
+        
         public Type GetConfigType() => typeof({info.ClassName});
         public Type GetMonitorType() => typeof(IOptionsMonitor<{info.ClassName}>);
         public object Dispatcher(object model, object receiver)
@@ -266,6 +289,8 @@ using Microsoft.Extensions.Options;
         {
             var attributes = prop.GetAttributes();
 
+            var perserveOnMergeAttr = attributes.FirstOrDefault(a => a.AttributeClass?.Name == "PerserveOnMergeAttribute");
+
             var displayAttr = attributes.FirstOrDefault(a => a.AttributeClass?.Name == "DisplayAttribute");
 
             // Look for [DisplayName("...")]
@@ -314,7 +339,8 @@ using Microsoft.Extensions.Options;
                 }
             }
 
-            return new PropertyInfo {
+            return new PropertyInfo
+            {
                 Name = prop.Name,
                 TypeName = prop.Type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat),
                 DisplayName = displayName ?? prop.Name, // Fallback to prop name
@@ -325,7 +351,8 @@ using Microsoft.Extensions.Options;
                 IsNewable = isNewableType,
                 GenericTypeOneIsNewable = itemTypeOneIsNewable,
                 GenericTypeTwoIsNewable = itemTypeTwoIsNewable,
-                symbol = prop
+                symbol = prop,
+                MergeIgnored = perserveOnMergeAttr != null
             };
         }
 
@@ -360,6 +387,11 @@ using Microsoft.Extensions.Options;
 
             if (!hasAttribute && !hasInterfaceAttribute) return null;
 
+            var mongoAttr = symbol.GetAttributes().FirstOrDefault(a => a.AttributeClass?.Name == "MongoOptionAttribute");
+            string? isVersioned = mongoAttr?.NamedArguments
+                .FirstOrDefault(arg => arg.Key == "VersionPropertyName")
+                .Value.Value?.ToString();
+            
             var displayAttr = symbol.GetAttributes().FirstOrDefault(a => a.AttributeClass?.Name == "CustomDispatcherAttribute");
             string? whitelist = displayAttr?.NamedArguments
                 .FirstOrDefault(arg => arg.Key == "WhiteList")
@@ -380,7 +412,8 @@ using Microsoft.Extensions.Options;
                 FullName = symbol.Name,
                 Properties = [],
                 WhiteList = WhiteList,
-                IsInterface = hasInterfaceAttribute
+                IsInterface = hasInterfaceAttribute,
+                VersionPropertyName = isVersioned
             };
 
             foreach (var property in properties) {
@@ -409,22 +442,6 @@ using Microsoft.Extensions.Options;
             }
 
             return false;
-        }
-
-        private static bool IsAllowed(IPropertySymbol propertySymbol, List<string> allowedTypes)
-        {
-            if (allowedTypes.Count == 0) return true; 
-            ITypeSymbol propertyType = propertySymbol.Type;
-
-            // 1. Get the simple name (e.g., "String" or "MyEnum")
-            string typeName = propertyType.Name;
-
-            // 2. Check if it's an Enum generally
-            bool isEnum = propertyType.TypeKind == TypeKind.Enum;
-
-            // 3. Perform the validation
-            return allowedTypes.Contains(typeName) ||
-                (allowedTypes.Contains("Enum") && isEnum);
         }
 
         private static bool IsTypeAllowed(IPropertySymbol propertySymbol, List<string> allowedTypes)
