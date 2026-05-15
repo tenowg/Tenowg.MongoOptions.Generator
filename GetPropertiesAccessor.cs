@@ -23,6 +23,7 @@ namespace MongoOptions.Generator
         public bool GenericTypeTwoIsNewable { get; set; }
         public IPropertySymbol? symbol { get; set; }
         public bool MergeIgnored { get; set; }
+        public ImmutableArray<INamedTypeSymbol> Interfaces { get; set; }
     }
 
     public class ClassInfo
@@ -110,6 +111,7 @@ using System;
 using System.Collections.Generic;
 using MongoOptions;
 using Microsoft.Extensions.Options;
+using System.Collections.Frozen;
 
 {(string.IsNullOrEmpty(ns) ? "" : $"namespace {ns}")}
 {{
@@ -126,7 +128,7 @@ using Microsoft.Extensions.Options;
             if (this == null) return default;
 
             var json = global::System.Text.Json.JsonSerializer.Serialize(this, global::{ns}.{shortName}JsonContext.Default.{shortName});
-            return global::System.Text.Json.JsonSerializer.Deserialize<{info.ClassName}>(json);
+            return global::System.Text.Json.JsonSerializer.Deserialize<{info.ClassName}>(json, global::{ns}.{shortName}JsonContext.Default.{shortName});
         }}
             
         public void Merge({info.ClassName} other)
@@ -173,7 +175,6 @@ using Microsoft.Extensions.Options;
                     var typedInstance = ({info.FullName})instance;
                     return (global::System.Linq.Expressions.Expression<global::System.Func<{typeName}>>)(() => typedInstance.{prop.Name});}},
                 ");
-
 
                 if (prop.IsNewable)
                 {
@@ -242,6 +243,17 @@ using Microsoft.Extensions.Options;
                     sb.AppendLine($@"                typeof({prop.GenericTypeTwo}),");
                 }
 
+                // build All Interfaces
+                sb.AppendLine($@"                Implements: new string[]");
+                sb.AppendLine("                {");
+
+                foreach (var type in prop.Interfaces)
+                {
+                    if (type != null)
+                        sb.AppendLine($"                    \"{type.ContainingNamespace.ToDisplayString()}.{type.MetadataName}\",");
+                }
+                sb.AppendLine("                }.ToFrozenSet(),");
+
                 BuildDispatcher(sb, info, prop);
 
                 sb.AppendLine("            );");
@@ -251,7 +263,7 @@ using Microsoft.Extensions.Options;
 
         private StringBuilder BuildDispatcher(StringBuilder sb, ClassInfo info, PropertyInfo? prop)
         {
-            string typeName = prop.TypeName;
+            string typeName = prop!.TypeName;
             string typeNameTwo = "";
             if (prop.GenericTypeOne != null) 
                 typeName = prop.GenericTypeOne;
@@ -268,7 +280,7 @@ using Microsoft.Extensions.Options;
 
             foreach (var interfaces in info.InterfaceClasses)
             {
-                if (IsTypeAllowed(prop.symbol, interfaces.WhiteList))
+                if (IsTypeAllowed(prop.symbol!, interfaces.WhiteList))
                 {
                     sb.Append($@"
                     if (dispatcher is {interfaces.ClassName} {interfaces.FullName}ui)
@@ -312,6 +324,8 @@ using Microsoft.Extensions.Options;
             var itemTypeOneIsNewable = isNewableType;
             var itemTypeTwoIsNewable = isNewableType;
             string? itemTypeNameTwo = null;
+            ImmutableArray<INamedTypeSymbol>? implements = null;
+            //ImmutableArray<INamedTypeSymbol>? nonGenericImplements = null;
 
             if (prop.Type is INamedTypeSymbol namedType && namedType.IsGenericType)
             {
@@ -337,6 +351,11 @@ using Microsoft.Extensions.Options;
                     itemTypeNameTwo = itemTypeTwo.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
                     itemTypeTwoIsNewable = IsNewable(itemTypeTwo);
                 }
+
+                var GenericImplements = namedType.AllInterfaces.Where(x => x.IsGenericType).Select(x => x.ConstructUnboundGenericType()).ToArray();
+                var nonGenericImplements = namedType.AllInterfaces.Where(x => !x.IsGenericType).ToArray();
+                implements = GenericImplements.Concat(nonGenericImplements).ToImmutableArray();
+
             }
 
             return new PropertyInfo
@@ -352,7 +371,8 @@ using Microsoft.Extensions.Options;
                 GenericTypeOneIsNewable = itemTypeOneIsNewable,
                 GenericTypeTwoIsNewable = itemTypeTwoIsNewable,
                 symbol = prop,
-                MergeIgnored = perserveOnMergeAttr != null
+                MergeIgnored = perserveOnMergeAttr != null,
+                Interfaces = implements ?? []
             };
         }
 
